@@ -7,6 +7,7 @@ const STORAGE_KEYS = {
   characters: 'serren_characters',
   modelsCache: 'models_cache_v1',
   modelsCacheTs: 'models_cache_ts_v1',
+  lastSyncAt: 'cloud_last_sync_at'
 };
 
 const DEFAULT_CHARACTER = {
@@ -34,6 +35,8 @@ const DEFAULT_SETTINGS = {
   showTimestamp: true,
   streaming: false,
   activeApiProfileId: DEFAULT_PROFILE.id,
+  supabaseUrl: '',
+  supabaseAnonKey: '',
   userProfile: {
     name: '我',
     avatarKey: 'user-avatar'
@@ -51,7 +54,10 @@ const state = {
   messagesCache: new Map(),
   loading: false,
   longPressActive: false,
-  models: []
+  models: [],
+  supabase: null,
+  session: null,
+  syncStatus: 'idle'
 };
 
 const view = document.getElementById('view');
@@ -79,7 +85,7 @@ function loadLocal(key, fallback) {
 
 function openDB() {
   return new Promise((resolve, reject) => {
-    const request = indexedDB.open('serren_chat_phone', 1);
+    const request = indexedDB.open('serren_chat_phone', 2);
     request.onupgradeneeded = () => {
       const db = request.result;
       if (!db.objectStoreNames.contains('messages')) {
@@ -88,6 +94,9 @@ function openDB() {
       }
       if (!db.objectStoreNames.contains('avatars')) {
         db.createObjectStore('avatars', { keyPath: 'key' });
+      }
+      if (!db.objectStoreNames.contains('pending_ops')) {
+        db.createObjectStore('pending_ops', { keyPath: 'id' });
       }
     };
     request.onsuccess = () => resolve(request.result);
@@ -140,6 +149,24 @@ async function getAvatar(key) {
       request.onerror = () => resolve(null);
     });
   });
+}
+
+async function addPendingOp(op) {
+  await withStore('pending_ops', 'readwrite', (store) => store.put(op));
+}
+
+async function getPendingOps() {
+  return withStore('pending_ops', 'readonly', (store) => {
+    return new Promise((resolve) => {
+      const request = store.getAll();
+      request.onsuccess = () => resolve(request.result || []);
+      request.onerror = () => resolve([]);
+    });
+  });
+}
+
+async function clearPendingOp(id) {
+  await withStore('pending_ops', 'readwrite', (store) => store.delete(id));
 }
 
 function formatTime(ts) {
@@ -239,6 +266,198 @@ function applyTheme() {
   document.body.className = state.settings.theme;
 }
 
+function setSyncStatus(status) {
+  state.syncStatus = status;
+  const badge = document.querySelector('[data-role="cloud-status"]');
+  if (badge) badge.textContent = status;
+}
+
+function initSupabase() {
+  if (!state.settings.supabaseUrl || !state.settings.supabaseAnonKey) {
+    state.supabase = null;
+    return null;
+  }
+  const client = window.supabase?.createClient(state.settings.supabaseUrl, state.settings.supabaseAnonKey);
+  state.supabase = client;
+  return client;
+}
+
+async function refreshSession() {
+  if (!state.supabase) return;
+  const { data, error } = await state.supabase.auth.getSession();
+  if (error) {
+    console.error('supabase session error', error);
+    return;
+  }
+  state.session = data.session;
+  setSyncStatus(state.session ? 'synced' : 'signed-out');
+}
+
+async function signInWithOtp(email) {
+  if (!state.supabase) return;
+  const { error } = await state.supabase.auth.signInWithOtp({ email });
+  if (error) {
+    console.error('supabase signIn error', error);
+    alert(`登录失败：${error.message}`);
+    return;
+  }
+  alert('已发送登录链接，请检查邮箱。');
+}
+
+async function signOutSupabase() {
+  if (!state.supabase) return;
+  const { error } = await state.supabase.auth.signOut();
+  if (error) {
+    console.error('supabase signOut error', error);
+  }
+  state.session = null;
+  render();
+}
+
+function getLastSyncAt() {
+  return Number(localStorage.getItem(STORAGE_KEYS.lastSyncAt) || 0);
+}
+
+function setLastSyncAt(ts) {
+  localStorage.setItem(STORAGE_KEYS.lastSyncAt, String(ts));
+}
+
+function mapConversationToCloud(conversation) {
+  return {
+    id: conversation.id,
+    user_id: state.session?.user?.id,
+    title: conversation.title,
+    updated_at: new Date(conversation.updatedAt).toISOString(),
+    preview: conversation.preview || '',
+    character_id: conversation.characterId,
+    api_profile_id: conversation.apiProfileId,
+    is_deleted: Boolean(conversation.isDeleted)
+  };
+}
+
+function mapMessageToCloud(message) {
+  return {
+    id: message.id,
+    user_id: state.session?.user?.id,
+    conversation_id: message.conversationId,
+    role: message.role,
+    content: message.content,
+    model: message.model || '',
+    tokens: message.tokens || null,
+    created_at: new Date(message.createdAt).toISOString(),
+    updated_at: new Date(message.createdAt).toISOString(),
+    is_deleted: Boolean(message.isDeleted)
+  };
+}
+
+function mergeConversationsFromCloud(rows) {
+  rows.forEach((row) => {
+    const existing = state.conversationsIndex.find((item) => item.id === row.id);
+    const merged = {
+      id: row.id,
+      title: row.title,
+      updatedAt: Date.parse(row.updated_at) || Date.now(),
+      preview: row.preview || '',
+      characterId: row.character_id,
+      apiProfileId: row.api_profile_id,
+      isDeleted: row.is_deleted
+    };
+    if (existing) {
+      Object.assign(existing, merged);
+    } else {
+      state.conversationsIndex.push(merged);
+    }
+  });
+  saveLocal(STORAGE_KEYS.conversations, state.conversationsIndex);
+}
+
+async function mergeMessagesFromCloud(rows) {
+  const grouped = rows.reduce((acc, row) => {
+    if (!acc[row.conversation_id]) acc[row.conversation_id] = [];
+    acc[row.conversation_id].push(row);
+    return acc;
+  }, {});
+  for (const [conversationId, messages] of Object.entries(grouped)) {
+    await ensureMessagesLoaded(conversationId);
+    const local = state.messagesCache.get(conversationId) || [];
+    const map = new Map(local.map((msg) => [msg.id, msg]));
+    messages.forEach((row) => {
+      map.set(row.id, {
+        id: row.id,
+        conversationId: row.conversation_id,
+        role: row.role,
+        content: row.content,
+        model: row.model || '',
+        tokens: row.tokens || null,
+        createdAt: Date.parse(row.created_at) || Date.now(),
+        isDeleted: row.is_deleted
+      });
+    });
+    const merged = Array.from(map.values());
+    state.messagesCache.set(conversationId, merged);
+    await saveMessages(conversationId, merged);
+  }
+}
+
+async function pushPendingOps() {
+  if (!state.supabase || !state.session) return;
+  const ops = await getPendingOps();
+  for (const op of ops) {
+    try {
+      if (op.table === 'conversations') {
+        if (op.action === 'delete') {
+          await state.supabase.from('conversations').update({ is_deleted: true }).eq('id', op.payload.id);
+        } else {
+          await state.supabase.from('conversations').upsert(mapConversationToCloud(op.payload));
+        }
+      }
+      if (op.table === 'messages') {
+        if (op.action === 'delete') {
+          await state.supabase.from('messages').update({ is_deleted: true }).eq('id', op.payload.id);
+        } else {
+          await state.supabase.from('messages').upsert(mapMessageToCloud(op.payload));
+        }
+      }
+      await clearPendingOp(op.id);
+    } catch (error) {
+      console.error('pending op failed', op, error);
+      throw error;
+    }
+  }
+}
+
+async function pullRemoteChanges() {
+  if (!state.supabase || !state.session) return;
+  const since = getLastSyncAt();
+  const sinceIso = new Date(since || 0).toISOString();
+  const { data: conversations, error: convoError } = await state.supabase
+    .from('conversations')
+    .select('*')
+    .gte('updated_at', sinceIso);
+  if (convoError) throw convoError;
+  const { data: messages, error: msgError } = await state.supabase
+    .from('messages')
+    .select('*')
+    .gte('updated_at', sinceIso);
+  if (msgError) throw msgError;
+  mergeConversationsFromCloud(conversations || []);
+  await mergeMessagesFromCloud(messages || []);
+  setLastSyncAt(Date.now());
+}
+
+async function runCloudSync() {
+  if (!state.supabase || !state.session) return;
+  try {
+    setSyncStatus('syncing');
+    await pushPendingOps();
+    await pullRemoteChanges();
+    setSyncStatus('synced');
+  } catch (error) {
+    console.error('sync error', error);
+    setSyncStatus('error');
+  }
+}
+
 function getActiveProfile(conversation) {
   const profileId = conversation?.apiProfileId || state.settings.activeApiProfileId;
   return state.apiProfiles.find((item) => item.id === profileId) || state.apiProfiles[0];
@@ -258,6 +477,37 @@ function updateConversationPreview(conversationId, message) {
   convo.preview = shorten(message.content, 40);
   convo.updatedAt = message.createdAt || Date.now();
   saveLocal(STORAGE_KEYS.conversations, state.conversationsIndex);
+  queueConversationSync(convo, 'update');
+}
+
+function queueConversationSync(conversation, action) {
+  const op = {
+    id: uuid(),
+    table: 'conversations',
+    action,
+    payload: {
+      ...conversation,
+      isDeleted: Boolean(conversation.isDeleted)
+    },
+    createdAt: Date.now()
+  };
+  addPendingOp(op);
+  if (state.session) runCloudSync();
+}
+
+function queueMessageSync(message, action) {
+  const op = {
+    id: uuid(),
+    table: 'messages',
+    action,
+    payload: {
+      ...message,
+      isDeleted: Boolean(message.isDeleted)
+    },
+    createdAt: Date.now()
+  };
+  addPendingOp(op);
+  if (state.session) runCloudSync();
 }
 
 function render() {
@@ -282,6 +532,7 @@ async function renderConversations() {
   }
   const items = await Promise.all(
     state.conversationsIndex
+      .filter((item) => !item.isDeleted)
       .sort((a, b) => b.updatedAt - a.updatedAt)
       .map(async (item) => {
         const character = getCharacter(item.characterId);
@@ -323,7 +574,7 @@ async function renderChatView() {
   }
   const character = getCharacter(conversation.characterId);
   const profile = getActiveProfile(conversation);
-  const messages = state.messagesCache.get(conversation.id) || [];
+  const messages = (state.messagesCache.get(conversation.id) || []).filter((msg) => !msg.isDeleted);
 
   const messageHtml = await Promise.all(
     messages.map(async (message) => {
@@ -511,6 +762,30 @@ function renderSettings() {
         <div class="footer-note">导出到 Gmail / 云端保存：TODO（后续阶段）</div>
       </div>
     </section>
+
+    <section class="section">
+      <div class="row">
+        <h2>云同步</h2>
+        <span class="badge" data-role="cloud-status">${state.syncStatus}</span>
+      </div>
+      <div class="card form-grid">
+        <label>Supabase URL
+          <input type="text" data-role="supabase-url" value="${state.settings.supabaseUrl}" />
+        </label>
+        <label>Supabase Anon Key
+          <input type="password" data-role="supabase-anon" value="${state.settings.supabaseAnonKey}" />
+        </label>
+        <label>登录邮箱
+          <input type="email" data-role="supabase-email" placeholder="you@example.com" />
+        </label>
+        <div class="row">
+          <button class="outline" data-action="save-supabase">保存配置</button>
+          <button class="outline" data-action="login-supabase">登录</button>
+          <button class="outline" data-action="logout-supabase">退出</button>
+        </div>
+        <div class="notice">不会上传或存储 OpenRouter API Key。</div>
+      </div>
+    </section>
   `;
 }
 
@@ -648,6 +923,7 @@ async function handleSendMessage() {
     createdAt: Date.now()
   };
   messages.push(userMessage);
+  queueMessageSync(userMessage, 'create');
   updateConversationPreview(conversation.id, userMessage);
   await saveMessages(conversation.id, messages);
   await requestAssistant(conversation, messages);
@@ -679,7 +955,7 @@ async function requestAssistant(conversation, messages) {
   }
 
   const history = messages
-    .filter((msg) => !msg.temp)
+    .filter((msg) => !msg.temp && !msg.isDeleted)
     .map((msg) => ({ role: msg.role, content: msg.content }));
 
   const systemPrompt = buildSystemPrompt(getCharacter(conversation.characterId));
@@ -730,6 +1006,7 @@ async function requestAssistant(conversation, messages) {
       typingMessage.temp = false;
       state.loading = false;
       updateConversationPreview(conversation.id, typingMessage);
+      queueMessageSync(typingMessage, 'create');
       await saveMessages(conversation.id, messages);
       await renderChatView();
       return;
@@ -743,6 +1020,7 @@ async function requestAssistant(conversation, messages) {
   typingMessage.temp = false;
   state.loading = false;
   updateConversationPreview(conversation.id, typingMessage);
+  queueMessageSync(typingMessage, 'create');
   await saveMessages(conversation.id, messages);
   await renderChatView();
 }
@@ -821,10 +1099,12 @@ function createConversation(characterId, profileId) {
     updatedAt: Date.now(),
     preview: '暂无消息',
     characterId: characterId || state.charactersIndex[0].id,
-    apiProfileId: profileId || state.settings.activeApiProfileId
+    apiProfileId: profileId || state.settings.activeApiProfileId,
+    isDeleted: false
   };
   state.conversationsIndex.push(conversation);
   saveLocal(STORAGE_KEYS.conversations, state.conversationsIndex);
+  queueConversationSync(conversation, 'create');
   state.activeConversationId = conversation.id;
   state.messagesCache.set(conversation.id, []);
   render();
@@ -859,10 +1139,20 @@ function openMessageMenu(messageId) {
 
 async function handleDeleteConversation(conversationId) {
   if (!confirm('确定删除该对话吗？')) return;
-  state.conversationsIndex = state.conversationsIndex.filter((item) => item.id !== conversationId);
+  const convo = getConversation(conversationId);
+  if (convo) {
+    convo.isDeleted = true;
+    convo.updatedAt = Date.now();
+    queueConversationSync(convo, 'delete');
+  }
   saveLocal(STORAGE_KEYS.conversations, state.conversationsIndex);
-  state.messagesCache.delete(conversationId);
-  await saveMessages(conversationId, []);
+  const messages = state.messagesCache.get(conversationId) || await getMessages(conversationId);
+  messages.forEach((message) => {
+    message.isDeleted = true;
+    queueMessageSync(message, 'delete');
+  });
+  state.messagesCache.set(conversationId, messages);
+  await saveMessages(conversationId, messages);
   if (state.activeConversationId === conversationId) {
     state.activeConversationId = null;
   }
@@ -876,6 +1166,8 @@ async function handleRenameConversation(conversationId) {
   const name = prompt('输入新的对话名称', convo.title);
   if (!name) return;
   convo.title = name;
+  convo.updatedAt = Date.now();
+  queueConversationSync(convo, 'update');
   saveLocal(STORAGE_KEYS.conversations, state.conversationsIndex);
   closeMenu();
   render();
@@ -892,9 +1184,13 @@ async function handleCopy(text) {
 async function handleDeleteMessage(messageId) {
   const conversation = getConversation(state.activeConversationId);
   const messages = state.messagesCache.get(conversation.id) || [];
-  const next = messages.filter((item) => item.id !== messageId);
-  state.messagesCache.set(conversation.id, next);
-  await saveMessages(conversation.id, next);
+  const target = messages.find((item) => item.id === messageId);
+  if (target) {
+    target.isDeleted = true;
+    queueMessageSync(target, 'delete');
+  }
+  state.messagesCache.set(conversation.id, messages);
+  await saveMessages(conversation.id, messages);
   closeMenu();
   render();
 }
@@ -910,7 +1206,14 @@ async function handleEditMessage(messageId) {
   const confirmEdit = confirm('编辑会影响后续回复，将删除该条之后的回复，继续吗？');
   if (!confirmEdit) return;
   message.content = content;
-  const trimmed = messages.slice(0, messageIndex + 1);
+  queueMessageSync(message, 'update');
+  const trimmed = messages.map((item, index) => {
+    if (index > messageIndex && item.role === 'assistant') {
+      item.isDeleted = true;
+      queueMessageSync(item, 'delete');
+    }
+    return item;
+  });
   state.messagesCache.set(conversation.id, trimmed);
   await saveMessages(conversation.id, trimmed);
   closeMenu();
@@ -922,7 +1225,13 @@ async function handleRegenerateMessage(messageId) {
   const messages = state.messagesCache.get(conversation.id) || [];
   const index = messages.findIndex((item) => item.id === messageId);
   if (index < 0) return;
-  const trimmed = messages.slice(0, index);
+  const trimmed = messages.map((item, idx) => {
+    if (idx >= index) {
+      item.isDeleted = true;
+      queueMessageSync(item, 'delete');
+    }
+    return item;
+  });
   state.messagesCache.set(conversation.id, trimmed);
   await saveMessages(conversation.id, trimmed);
   closeMenu();
@@ -1180,6 +1489,16 @@ function handleSettingsChange() {
   saveLocal(STORAGE_KEYS.settings, state.settings);
 }
 
+function saveSupabaseSettings() {
+  const urlInput = document.querySelector('[data-role="supabase-url"]');
+  const anonInput = document.querySelector('[data-role="supabase-anon"]');
+  if (urlInput) state.settings.supabaseUrl = urlInput.value.trim();
+  if (anonInput) state.settings.supabaseAnonKey = anonInput.value.trim();
+  saveLocal(STORAGE_KEYS.settings, state.settings);
+  initSupabase();
+  setSyncStatus(state.supabase ? 'signed-out' : 'not-configured');
+}
+
 function init() {
   state.settings = loadLocal(STORAGE_KEYS.settings, DEFAULT_SETTINGS);
   state.apiProfiles = loadLocal(STORAGE_KEYS.apiProfiles, [DEFAULT_PROFILE]).map((profile) => ({
@@ -1197,7 +1516,25 @@ function init() {
     state.charactersIndex = [DEFAULT_CHARACTER];
   }
   applyTheme();
+  initSupabase();
+  if (state.supabase) {
+    state.supabase.auth.onAuthStateChange((_event, session) => {
+      state.session = session;
+      setSyncStatus(session ? 'synced' : 'signed-out');
+      render();
+      if (session) {
+        runCloudSync();
+      }
+    });
+  } else {
+    setSyncStatus('not-configured');
+  }
   render();
+  refreshSession().then(() => {
+    if (state.session) {
+      runCloudSync();
+    }
+  });
   registerServiceWorker();
 }
 
@@ -1337,6 +1674,23 @@ document.addEventListener('click', async (event) => {
       break;
     case 'test-profile':
       await testProfileConnection();
+      break;
+    case 'save-supabase':
+      saveSupabaseSettings();
+      render();
+      break;
+    case 'login-supabase': {
+      saveSupabaseSettings();
+      const email = document.querySelector('[data-role="supabase-email"]')?.value.trim();
+      if (email) {
+        await signInWithOtp(email);
+      } else {
+        alert('请输入邮箱。');
+      }
+      break;
+    }
+    case 'logout-supabase':
+      await signOutSupabase();
       break;
     case 'delete-profile':
       deleteProfile(id);
