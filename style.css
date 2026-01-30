@@ -2,6 +2,7 @@
   color-scheme: light;
   font-family: "Inter", "SF Pro", "PingFang SC", system-ui, sans-serif;
   font-size: 16px;
+  --tabbar-h: 76px;
   --bg: #f4f6fb;
   --bg-soft: rgba(255, 255, 255, 0.65);
   --card: rgba(255, 255, 255, 0.78);
@@ -72,12 +73,14 @@ body.theme-dusk {
 
 .view {
   flex: 1;
-  padding: 0 16px 92px;
+  padding: 0 16px calc(var(--tabbar-h) + 16px);
   overflow-y: auto;
+  display: flex;
+  flex-direction: column;
 }
 
 body.keyboard-open .view {
-  padding-bottom: 140px;
+  padding-bottom: calc(var(--tabbar-h) + 140px);
 }
 
 .tabbar {
@@ -90,6 +93,7 @@ body.keyboard-open .view {
   background: var(--glass);
   backdrop-filter: blur(16px);
   border-top: 1px solid var(--border);
+  height: var(--tabbar-h);
 }
 
 .tab {
@@ -175,6 +179,7 @@ body.keyboard-open .view {
   gap: 12px;
   margin: 12px 0 8px;
   padding: 12px;
+  flex: 0 0 auto;
 }
 
 .chat-header h2 {
@@ -182,11 +187,22 @@ body.keyboard-open .view {
   font-size: 1.05rem;
 }
 
+.chat-page {
+  flex: 1;
+  min-height: 100dvh;
+  display: flex;
+  flex-direction: column;
+}
+
 .chat-area {
   display: flex;
   flex-direction: column;
   gap: 12px;
   padding-bottom: 12px;
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  -webkit-overflow-scrolling: touch;
 }
 
 .message {
@@ -218,9 +234,9 @@ body.keyboard-open .view {
   gap: 8px;
 }
 
-.chat-input {
+.chat-composer {
   position: sticky;
-  bottom: 70px;
+  bottom: var(--tabbar-h);
   padding: 12px;
   display: flex;
   gap: 8px;
@@ -228,10 +244,11 @@ body.keyboard-open .view {
   border-radius: 20px;
   backdrop-filter: blur(16px);
   border: 1px solid var(--border);
+  padding-bottom: calc(10px + env(safe-area-inset-bottom));
 }
 
-body.keyboard-open .chat-input {
-  bottom: 120px;
+body.keyboard-open .chat-composer {
+  bottom: calc(var(--tabbar-h) + 140px);
 }
 
 textarea,

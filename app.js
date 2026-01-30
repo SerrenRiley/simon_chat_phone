@@ -2,7 +2,15 @@ const STORAGE_KEYS = {
   settings: 'serren_settings',
   apiProfiles: 'serren_api_profiles',
   conversations: 'serren_conversations',
-  characters: 'serren_characters'
+const STORAGE_KEYS = {
+  settings: 'serren_settings',
+  apiProfiles: 'serren_api_profiles',
+  conversations: 'serren_conversations',
+  characters: 'serren_characters',
+  modelsCache: 'models_cache_v1',
+  modelsCacheTs: 'models_cache_ts_v1',
+};
+
 };
 
 const DEFAULT_CHARACTER = {
@@ -17,7 +25,15 @@ const DEFAULT_PROFILE = {
   name: 'OpenRouter',
   apiKey: '',
   baseUrl: 'https://openrouter.ai/api/v1',
-  model: 'openai/gpt-4o-mini'
+const DEFAULT_API_PROFILE = {
+  id: 'api-openrouter',
+  name: 'OpenRouter',
+  apiKey: '',
+  baseUrl: 'https://openrouter.ai/api/v1',
+  model: 'openrouter/auto',
+  fallbackModels: ['openrouter/auto'],
+};
+
 };
 
 const DEFAULT_SETTINGS = {
@@ -45,7 +61,8 @@ const state = {
   charactersIndex: [],
   messagesCache: new Map(),
   loading: false,
-  longPressActive: false
+  longPressActive: false,
+  models: []
 };
 
 const view = document.getElementById('view');
@@ -149,6 +166,84 @@ function formatDate(ts) {
 function shorten(text, limit = 32) {
   if (!text) return '';
   return text.length > limit ? `${text.slice(0, limit)}…` : text;
+}
+
+function normalizeBaseUrl(url) {
+  if (!url) return '';
+  return url.replace(/\/+$/, '');
+}
+
+function loadModelsCache() {
+  const cache = loadLocal(STORAGE_KEYS.modelsCache, null);
+  const ts = Number(localStorage.getItem(STORAGE_KEYS.modelsCacheTs) || 0);
+  return { cache, ts };
+}
+
+function saveModelsCache(baseUrl, models) {
+  saveLocal(STORAGE_KEYS.modelsCache, { baseUrl, models });
+  localStorage.setItem(STORAGE_KEYS.modelsCacheTs, String(Date.now()));
+}
+
+async function fetchModels(baseUrl, apiKey, forceRefresh = false) {
+  const normalized = normalizeBaseUrl(baseUrl || DEFAULT_PROFILE.baseUrl);
+  const { cache, ts } = loadModelsCache();
+  const now = Date.now();
+  if (!forceRefresh && cache?.models && cache.baseUrl === normalized && now - ts < 24 * 60 * 60 * 1000) {
+    return cache.models;
+  }
+
+  try {
+    const response = await fetch(`${normalized}/models`, {
+      method: 'GET',
+      headers: apiKey ? { Authorization: `Bearer ${apiKey}` } : undefined
+    });
+    if (!response.ok) {
+      console.error('模型列表请求失败', response.status);
+      return cache?.models || [];
+    }
+    const data = await response.json();
+    const models = data?.data || data?.models || data || [];
+    saveModelsCache(normalized, models);
+    return models;
+  } catch (error) {
+    console.error('模型列表请求异常', error);
+    return cache?.models || [];
+  }
+}
+
+function normalizeFallbackModels(primaryModel, fallbackModels) {
+  const clean = (fallbackModels || [])
+    .map((model) => model?.trim())
+    .filter(Boolean)
+    .filter((model) => model !== primaryModel);
+  if (!clean.includes('openrouter/auto') && primaryModel !== 'openrouter/auto') {
+    clean.push('openrouter/auto');
+  }
+  return [...new Set(clean)];
+}
+
+function buildModelFallbacks(profile) {
+  const primary = profile?.model || 'openrouter/auto';
+  const fallbacks = normalizeFallbackModels(primary, profile?.fallbackModels || []);
+  return [primary, ...fallbacks];
+}
+
+function shouldRetryWithoutModelsParam(errorText) {
+  if (!errorText) return false;
+  return /models/i.test(errorText) && /(unknown|unrecognized|unsupported|invalid)/i.test(errorText);
+}
+
+function buildChatRequestBody({ model, models, systemPrompt, history, temperature, stream }) {
+  const body = {
+    model,
+    messages: [{ role: 'system', content: systemPrompt }, ...history],
+    temperature,
+    stream
+  };
+  if (models && models.length > 1) {
+    body.models = models;
+  }
+  return body;
 }
 
 function applyTheme() {
@@ -268,7 +363,7 @@ async function renderChatView() {
   );
 
   view.innerHTML = `
-    <section class="section">
+    <section class="section chat-page">
       <div class="chat-header card">
         <div class="avatar">${await renderAvatar(character.avatarKey, character.name)}</div>
         <div>
@@ -276,16 +371,17 @@ async function renderChatView() {
           <div class="badge">${profile?.name || '未选择 API'} · ${profile?.model || '未设置模型'}</div>
         </div>
       </div>
-      <div class="chat-area">
+      <div class="chat-area" data-role="chat-area">
         ${messageHtml.join('') || '<div class="notice">开始和角色聊聊吧～</div>'}
       </div>
-      <div class="chat-input">
+      <div class="chat-composer">
         <textarea class="message-input" placeholder="输入消息..." data-role="message-input"></textarea>
         <button class="primary" data-action="send-message" ${state.loading ? 'disabled' : ''}>发送</button>
       </div>
       <button class="outline" data-action="back-to-conversations">← 返回对话列表</button>
     </section>
   `;
+  scrollChatToBottom();
 }
 
 async function renderCharacters() {
@@ -421,7 +517,7 @@ function renderSettings() {
         </div>
         <div class="toggle">
           <input type="checkbox" data-role="toggle-stream" ${state.settings.streaming ? 'checked' : ''} />
-          <label>Streaming（TODO）</label>
+          <label>流式输出 Streaming</label>
         </div>
         <div class="footer-note">导出到 Gmail / 云端保存：TODO（后续阶段）</div>
       </div>
@@ -494,6 +590,56 @@ async function ensureMessagesLoaded(conversationId) {
   state.messagesCache.set(conversationId, messages);
 }
 
+function scrollChatToBottom() {
+  const area = document.querySelector('[data-role="chat-area"]');
+  if (area) {
+    area.scrollTop = area.scrollHeight;
+  }
+}
+
+async function parseErrorResponse(response) {
+  const contentType = response.headers.get('content-type') || '';
+  let bodyText = '';
+  try {
+    if (contentType.includes('application/json')) {
+      const data = await response.json();
+      bodyText = JSON.stringify(data);
+    } else {
+      bodyText = await response.text();
+    }
+  } catch (error) {
+    bodyText = `无法解析错误响应：${error.message}`;
+  }
+  return `HTTP ${response.status} ${response.statusText}\n${bodyText}`;
+}
+
+async function attemptChatCompletion({
+  profile,
+  history,
+  systemPrompt,
+  model,
+  models,
+  stream
+}) {
+  const baseUrl = normalizeBaseUrl(profile.baseUrl);
+  const response = await fetch(`${baseUrl}/chat/completions`, {
+    method: 'POST',
+    headers: {
+      Authorization: `Bearer ${profile.apiKey}`,
+      'Content-Type': 'application/json'
+    },
+    body: JSON.stringify(buildChatRequestBody({
+      model,
+      models,
+      systemPrompt,
+      history,
+      temperature: state.settings.temperature,
+      stream
+    }))
+  });
+  return response;
+}
+
 async function handleSendMessage() {
   const input = document.querySelector('[data-role="message-input"]');
   if (!input) return;
@@ -548,43 +694,109 @@ async function requestAssistant(conversation, messages) {
     .map((msg) => ({ role: msg.role, content: msg.content }));
 
   const systemPrompt = buildSystemPrompt(getCharacter(conversation.characterId));
+  const modelsList = buildModelFallbacks(profile);
+  let allowModelsParam = true;
+  let lastError = '';
 
   try {
-    const response = await fetch(`${profile.baseUrl}/chat/completions`, {
-      method: 'POST',
-      headers: {
-        Authorization: `Bearer ${profile.apiKey}`,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({
-        model: profile.model,
-        messages: [{ role: 'system', content: systemPrompt }, ...history],
-        temperature: state.settings.temperature
-      })
-    });
+    for (let attemptIndex = 0; attemptIndex < modelsList.length; attemptIndex += 1) {
+      const model = modelsList[attemptIndex];
+      const response = await attemptChatCompletion({
+        profile,
+        history,
+        systemPrompt,
+        model,
+        models: allowModelsParam ? modelsList : null,
+        stream: state.settings.streaming
+      });
 
-    const data = await response.json();
-    const reply = data?.choices?.[0]?.message?.content || '（没有回复内容）';
-    const usage = data?.usage;
-    typingMessage.content = reply;
-    typingMessage.temp = false;
-    typingMessage.model = profile.model;
-    if (usage) {
-      typingMessage.tokens = {
-        prompt: usage.prompt_tokens,
-        completion: usage.completion_tokens,
-        total: usage.total_tokens
-      };
+      if (!response.ok) {
+        const errorText = await parseErrorResponse(response);
+        lastError = errorText;
+        console.error('chat/completions error', errorText);
+        if (allowModelsParam && shouldRetryWithoutModelsParam(errorText)) {
+          allowModelsParam = false;
+          attemptIndex = -1;
+          continue;
+        }
+        continue;
+      }
+
+      if (state.settings.streaming) {
+        await handleStreamingResponse(response, typingMessage, model);
+      } else {
+        const data = await response.json();
+        const reply = data?.choices?.[0]?.message?.content || '（没有回复内容）';
+        const usage = data?.usage;
+        typingMessage.content = reply;
+        typingMessage.model = model;
+        if (usage) {
+          typingMessage.tokens = {
+            prompt: usage.prompt_tokens,
+            completion: usage.completion_tokens,
+            total: usage.total_tokens
+          };
+        }
+      }
+      typingMessage.temp = false;
+      state.loading = false;
+      updateConversationPreview(conversation.id, typingMessage);
+      await saveMessages(conversation.id, messages);
+      await renderChatView();
+      return;
     }
   } catch (error) {
-    typingMessage.content = `请求失败：${error.message}`;
-    typingMessage.temp = false;
+    lastError = `${error.name}: ${error.message}`;
+    console.error('chat/completions exception', error);
   }
 
+  typingMessage.content = `请求失败：${lastError || '未知错误'}`;
+  typingMessage.temp = false;
   state.loading = false;
   updateConversationPreview(conversation.id, typingMessage);
   await saveMessages(conversation.id, messages);
   await renderChatView();
+}
+
+async function handleStreamingResponse(response, typingMessage, modelName) {
+  const reader = response.body?.getReader();
+  if (!reader) {
+    typingMessage.content = '请求失败：未获得可读流。';
+    typingMessage.temp = false;
+    return;
+  }
+  const decoder = new TextDecoder('utf-8');
+  let buffer = '';
+  typingMessage.content = typingMessage.content || '正在输入…';
+  typingMessage.model = modelName;
+  typingMessage.temp = false;
+
+  while (true) {
+    const { value, done } = await reader.read();
+    if (done) break;
+    buffer += decoder.decode(value, { stream: true });
+    const lines = buffer.split('\n');
+    buffer = lines.pop() || '';
+    for (const line of lines) {
+      const trimmed = line.trim();
+      if (!trimmed.startsWith('data:')) continue;
+      const payload = trimmed.replace(/^data:\s*/, '');
+      if (payload === '[DONE]') continue;
+      try {
+        const json = JSON.parse(payload);
+        const delta = json?.choices?.[0]?.delta?.content || '';
+        if (delta) {
+          if (typingMessage.content === '正在输入…') {
+            typingMessage.content = '';
+          }
+          typingMessage.content += delta;
+          await renderChatView();
+        }
+      } catch (error) {
+        console.error('流式解析失败', error);
+      }
+    }
+  }
 }
 
 function openNewConversationModal() {
@@ -779,6 +991,45 @@ function openUserProfileModal() {
   `);
 }
 
+async function populateModelList(forceRefresh) {
+  const baseInput = modal.querySelector('[data-role="profile-base"]');
+  const keyInput = modal.querySelector('[data-role="profile-key"]');
+  const list = modal.querySelector('#model-options');
+  const status = modal.querySelector('[data-role="models-status"]');
+  if (!baseInput || !list || !status) return;
+  status.textContent = '正在加载模型列表...';
+  const models = await fetchModels(baseInput.value, keyInput?.value, forceRefresh);
+  state.models = models;
+  list.innerHTML = models.map((model) => {
+    const name = model.name || model.id || 'unknown';
+    const context = model.context_length ? ` · ${model.context_length} ctx` : '';
+    const label = `${name} (${model.id})${context}`;
+    return `<option value="${model.id}">${label}</option>`;
+  }).join('');
+  status.textContent = models.length ? `已加载 ${models.length} 个模型` : '未获取到模型列表';
+}
+
+function getFallbackModelsFromModal() {
+  return Array.from(modal.querySelectorAll('[data-role="fallback-model"]'))
+    .map((input) => input.value.trim())
+    .filter(Boolean);
+}
+
+function renderFallbackList(models) {
+  const container = modal.querySelector('[data-role="fallback-list"]');
+  if (!container) return;
+  container.innerHTML = models.map((model, index) => `
+    <div class="row">
+      <input type="text" list="model-options" data-role="fallback-model" value="${model}" />
+      <div class="badge-group">
+        <button class="icon-button" data-action="move-fallback-up" data-index="${index}">↑</button>
+        <button class="icon-button" data-action="move-fallback-down" data-index="${index}">↓</button>
+        <button class="icon-button" data-action="remove-fallback" data-index="${index}">移除</button>
+      </div>
+    </div>
+  `).join('');
+}
+
 async function saveUserProfile() {
   const nameInput = modal.querySelector('[data-role="user-name"]');
   const fileInput = modal.querySelector('[data-role="user-avatar"]');
@@ -792,10 +1043,12 @@ async function saveUserProfile() {
   render();
 }
 
-function openProfileModal(profileId) {
+async function openProfileModal(profileId) {
   const profile = profileId
     ? state.apiProfiles.find((item) => item.id === profileId)
     : { id: uuid(), name: '', apiKey: '', baseUrl: DEFAULT_PROFILE.baseUrl, model: DEFAULT_PROFILE.model };
+  const modelValue = profile.model || 'openrouter/auto';
+  const fallbackModels = normalizeFallbackModels(modelValue, profile.fallbackModels || []);
   openModal(`
     <h3>${profileId ? '编辑' : '新建'} API Profile</h3>
     <div class="form-grid">
@@ -809,38 +1062,100 @@ function openProfileModal(profileId) {
         <input type="text" data-role="profile-base" value="${profile.baseUrl}" />
       </label>
       <label>模型
-        <input type="text" data-role="profile-model" value="${profile.model}" />
+        <input type="text" list="model-options" data-role="profile-model" value="${modelValue}" />
+        <datalist id="model-options"></datalist>
+        <div class="notice" data-role="models-status">正在加载模型列表...</div>
+        <button class="outline" type="button" data-action="refresh-models">刷新模型列表</button>
         <div class="inline-inputs">
+          <button class="outline" data-action="fill-model" data-model="openrouter/auto">openrouter/auto</button>
           <button class="outline" data-action="fill-model" data-model="openai/gpt-4o-mini">gpt-4o-mini</button>
           <button class="outline" data-action="fill-model" data-model="openai/gpt-4o">gpt-4o</button>
           <button class="outline" data-action="fill-model" data-model="anthropic/claude-3.5-sonnet">claude-3.5</button>
         </div>
       </label>
+      <label>Fallback 模型列表
+        <div class="form-grid" data-role="fallback-list"></div>
+        <button class="outline" type="button" data-action="add-fallback">添加备用模型</button>
+      </label>
+      <div class="notice" data-role="profile-test-result"></div>
       <input type="hidden" data-role="profile-id" value="${profile.id}" />
       <div class="row">
         <button class="outline" data-action="close-modal">取消</button>
+        <button class="outline" data-action="test-profile">测试</button>
         <button class="primary" data-action="save-profile">保存</button>
       </div>
     </div>
   `);
+  await populateModelList(false);
+  renderFallbackList(fallbackModels);
 }
 
 function saveProfile() {
   const id = modal.querySelector('[data-role="profile-id"]').value;
   const name = modal.querySelector('[data-role="profile-name"]').value.trim() || '未命名 API';
   const apiKey = modal.querySelector('[data-role="profile-key"]').value.trim();
-  const baseUrl = modal.querySelector('[data-role="profile-base"]').value.trim() || DEFAULT_PROFILE.baseUrl;
-  const model = modal.querySelector('[data-role="profile-model"]').value.trim() || DEFAULT_PROFILE.model;
+  const baseUrl = normalizeBaseUrl(modal.querySelector('[data-role="profile-base"]').value.trim() || DEFAULT_PROFILE.baseUrl);
+  const model = modal.querySelector('[data-role="profile-model"]').value.trim() || 'openrouter/auto';
+  const fallbackModels = normalizeFallbackModels(model, getFallbackModelsFromModal());
 
   const existing = state.apiProfiles.find((item) => item.id === id);
   if (existing) {
-    Object.assign(existing, { name, apiKey, baseUrl, model });
+    Object.assign(existing, { name, apiKey, baseUrl, model, fallbackModels });
   } else {
-    state.apiProfiles.push({ id, name, apiKey, baseUrl, model });
+    state.apiProfiles.push({ id, name, apiKey, baseUrl, model, fallbackModels });
   }
   saveLocal(STORAGE_KEYS.apiProfiles, state.apiProfiles);
   closeModal();
   render();
+}
+
+async function testProfileConnection() {
+  const result = modal.querySelector('[data-role="profile-test-result"]');
+  if (!result) return;
+  result.textContent = '测试中...';
+  const apiKey = modal.querySelector('[data-role="profile-key"]')?.value.trim();
+  const baseUrl = normalizeBaseUrl(modal.querySelector('[data-role="profile-base"]')?.value.trim() || DEFAULT_PROFILE.baseUrl);
+  const model = modal.querySelector('[data-role="profile-model"]')?.value.trim() || 'openrouter/auto';
+  const fallbackModels = normalizeFallbackModels(model, getFallbackModelsFromModal());
+  const profile = { apiKey, baseUrl, model, fallbackModels };
+  const modelsList = buildModelFallbacks(profile);
+  const history = [{ role: 'user', content: 'ping' }];
+  const systemPrompt = 'You are a helpful assistant.';
+  let allowModelsParam = true;
+  let lastError = '';
+
+  try {
+    for (let attemptIndex = 0; attemptIndex < modelsList.length; attemptIndex += 1) {
+      const response = await attemptChatCompletion({
+        profile,
+        history,
+        systemPrompt,
+        model: modelsList[attemptIndex],
+        models: allowModelsParam ? modelsList : null,
+        stream: false
+      });
+      if (!response.ok) {
+        const errorText = await parseErrorResponse(response);
+        lastError = errorText;
+        console.error('profile test error', errorText);
+        if (allowModelsParam && shouldRetryWithoutModelsParam(errorText)) {
+          allowModelsParam = false;
+          attemptIndex = -1;
+          continue;
+        }
+        continue;
+      }
+      const data = await response.json();
+      const reply = data?.choices?.[0]?.message?.content || '（无回复内容）';
+      result.textContent = `✅ HTTP ${response.status} ${response.statusText}: ${shorten(reply, 60)}`;
+      return;
+    }
+  } catch (error) {
+    lastError = `${error.name}: ${error.message}`;
+    console.error('profile test exception', error);
+  }
+
+  result.textContent = `❌ 请求失败：${lastError || '未知错误'}`;
 }
 
 function deleteProfile(profileId) {
@@ -878,7 +1193,12 @@ function handleSettingsChange() {
 
 function init() {
   state.settings = loadLocal(STORAGE_KEYS.settings, DEFAULT_SETTINGS);
-  state.apiProfiles = loadLocal(STORAGE_KEYS.apiProfiles, [DEFAULT_PROFILE]);
+  state.apiProfiles = loadLocal(STORAGE_KEYS.apiProfiles, [DEFAULT_PROFILE]).map((profile) => ({
+    ...profile,
+    baseUrl: normalizeBaseUrl(profile.baseUrl || DEFAULT_PROFILE.baseUrl),
+    model: profile.model || 'openrouter/auto',
+    fallbackModels: normalizeFallbackModels(profile.model || 'openrouter/auto', profile.fallbackModels || [])
+  }));
   state.charactersIndex = loadLocal(STORAGE_KEYS.characters, [DEFAULT_CHARACTER]);
   state.conversationsIndex = loadLocal(STORAGE_KEYS.conversations, []);
   if (!state.apiProfiles.length) {
@@ -1018,13 +1338,16 @@ document.addEventListener('click', async (event) => {
       await saveUserProfile();
       break;
     case 'new-profile':
-      openProfileModal();
+      await openProfileModal();
       break;
     case 'edit-profile':
-      openProfileModal(id);
+      await openProfileModal(id);
       break;
     case 'save-profile':
       saveProfile();
+      break;
+    case 'test-profile':
+      await testProfileConnection();
       break;
     case 'delete-profile':
       deleteProfile(id);
@@ -1034,6 +1357,40 @@ document.addEventListener('click', async (event) => {
       if (input) input.value = model;
       break;
     }
+    case 'add-fallback': {
+      const current = getFallbackModelsFromModal();
+      current.push('openrouter/auto');
+      renderFallbackList(current);
+      break;
+    }
+    case 'remove-fallback': {
+      const index = Number(action.dataset.index);
+      const current = getFallbackModelsFromModal();
+      current.splice(index, 1);
+      renderFallbackList(current);
+      break;
+    }
+    case 'move-fallback-up': {
+      const index = Number(action.dataset.index);
+      const current = getFallbackModelsFromModal();
+      if (index > 0) {
+        [current[index - 1], current[index]] = [current[index], current[index - 1]];
+        renderFallbackList(current);
+      }
+      break;
+    }
+    case 'move-fallback-down': {
+      const index = Number(action.dataset.index);
+      const current = getFallbackModelsFromModal();
+      if (index < current.length - 1) {
+        [current[index + 1], current[index]] = [current[index], current[index + 1]];
+        renderFallbackList(current);
+      }
+      break;
+    }
+    case 'refresh-models':
+      await populateModelList(true);
+      break;
     case 'switch-tab':
       if (tab) {
         state.currentTab = tab;
