@@ -2,9 +2,15 @@ const STORAGE_KEYS = {
   settings: 'serren_settings',
   apiProfiles: 'serren_api_profiles',
   conversations: 'serren_conversations',
+const STORAGE_KEYS = {
+  settings: 'serren_settings',
+  apiProfiles: 'serren_api_profiles',
+  conversations: 'serren_conversations',
   characters: 'serren_characters',
   modelsCache: 'models_cache_v1',
-  modelsCacheTs: 'models_cache_ts_v1'
+  modelsCacheTs: 'models_cache_ts_v1',
+};
+
 };
 
 const DEFAULT_CHARACTER = {
@@ -19,8 +25,15 @@ const DEFAULT_PROFILE = {
   name: 'OpenRouter',
   apiKey: '',
   baseUrl: 'https://openrouter.ai/api/v1',
+const DEFAULT_API_PROFILE = {
+  id: 'api-openrouter',
+  name: 'OpenRouter',
+  apiKey: '',
+  baseUrl: 'https://openrouter.ai/api/v1',
   model: 'openrouter/auto',
-  fallbackModels: ['openrouter/auto']
+  fallbackModels: ['openrouter/auto'],
+};
+
 };
 
 const DEFAULT_SETTINGS = {
