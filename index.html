@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no" />
+  <title>serren-chat-phone</title>
+  <link rel="manifest" href="manifest.json" />
+  <link rel="stylesheet" href="style.css" />
+</head>
+<body class="theme-glass">
+  <div id="app" class="app">
+    <header class="status-bar">
+      <div class="logo">serren-chat-phone</div>
+      <button class="icon-button" data-action="open-settings">⚙️</button>
+    </header>
+
+    <main id="view" class="view"></main>
+
+    <nav class="tabbar" role="tablist">
+      <button class="tab" data-action="switch-tab" data-tab="conversations" aria-selected="true">💬 对话</button>
+      <button class="tab" data-action="switch-tab" data-tab="characters">🧸 角色</button>
+      <button class="tab" data-action="switch-tab" data-tab="settings">⚙️ 设置</button>
+    </nav>
+  </div>
+
+  <div id="modal" class="modal hidden" aria-hidden="true"></div>
+  <div id="menu" class="menu hidden" aria-hidden="true"></div>
+
+  <script src="https://cdn.jsdelivr.net/npm/@supabase/supabase-js@2"></script>
+  <script src="app.js"></script>
+</body>
+</html>

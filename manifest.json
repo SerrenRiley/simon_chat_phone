@@ -1,0 +1,9 @@
+{
+  "name": "serren-chat-phone",
+  "short_name": "serren-chat",
+  "start_url": ".",
+  "display": "standalone",
+  "background_color": "#f4f6fb",
+  "theme_color": "#8bb7ff",
+  "icons": []
+}
