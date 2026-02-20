@@ -343,11 +343,38 @@ function mapMessageToCloud(message) {
     role: message.role,
     content: message.content,
     model: message.model || '',
-    tokens: message.tokens || null,
+    tokens_prompt: message.tokens?.prompt ?? null,
+    tokens_completion: message.tokens?.completion ?? null,
+    tokens_total: message.tokens?.total ?? null,
     created_at: new Date(message.createdAt).toISOString(),
-    updated_at: new Date(message.createdAt).toISOString(),
+    updated_at: new Date(message.updatedAt || message.createdAt).toISOString(),
     is_deleted: Boolean(message.isDeleted)
   };
+}
+
+async function storeMessageInSupabase(message) {
+  if (!state.supabase || !state.session) return { success: false, skipped: true };
+  const payload = mapMessageToCloud(message);
+  const { error } = await state.supabase.from('messages').upsert(payload);
+  if (error) {
+    console.error('storeMessageInSupabase failed', error, payload);
+    return { success: false, error };
+  }
+  return { success: true };
+}
+
+async function fetchMessagesFromSupabase(conversationId) {
+  if (!state.supabase || !state.session) return [];
+  const { data, error } = await state.supabase
+    .from('messages')
+    .select('*')
+    .eq('conversation_id', conversationId)
+    .order('created_at', { ascending: true });
+  if (error) {
+    console.error('fetchMessagesFromSupabase failed', error, { conversationId });
+    return [];
+  }
+  return data || [];
 }
 
 function mergeConversationsFromCloud(rows) {
@@ -388,8 +415,13 @@ async function mergeMessagesFromCloud(rows) {
         role: row.role,
         content: row.content,
         model: row.model || '',
-        tokens: row.tokens || null,
+        tokens: {
+          prompt: row.tokens_prompt ?? null,
+          completion: row.tokens_completion ?? null,
+          total: row.tokens_total ?? null
+        },
         createdAt: Date.parse(row.created_at) || Date.now(),
+        updatedAt: Date.parse(row.updated_at) || Date.now(),
         isDeleted: row.is_deleted
       });
     });
@@ -415,7 +447,8 @@ async function pushPendingOps() {
         if (op.action === 'delete') {
           await state.supabase.from('messages').update({ is_deleted: true }).eq('id', op.payload.id);
         } else {
-          await state.supabase.from('messages').upsert(mapMessageToCloud(op.payload));
+          const result = await storeMessageInSupabase(op.payload);
+          if (!result.success) throw result.error;
         }
       }
       await clearPendingOp(op.id);
@@ -507,7 +540,14 @@ function queueMessageSync(message, action) {
     createdAt: Date.now()
   };
   addPendingOp(op);
-  if (state.session) runCloudSync();
+  if (state.session) {
+    runCloudSync();
+    if (action !== 'delete') {
+      storeMessageInSupabase(message).catch((error) => {
+        console.error('direct message store failed', error);
+      });
+    }
+  }
 }
 
 function render() {
@@ -585,8 +625,10 @@ async function renderChatView() {
       if (state.settings.showTimestamp) meta.push(formatTime(message.createdAt));
       if (state.settings.showModel && message.model) meta.push(message.model);
       if (state.settings.showTokens) {
-        const tokens = message.tokens?.total ?? '—';
-        meta.push(`tokens:${tokens}`);
+        const promptTokens = message.tokens?.prompt ?? '—';
+        const completionTokens = message.tokens?.completion ?? '—';
+        const totalTokens = message.tokens?.total ?? '—';
+        meta.push(`tokens p:${promptTokens} c:${completionTokens} t:${totalTokens}`);
       }
       return `
         <div class="message ${message.role}" data-action="message-menu" data-id="${message.id}">
@@ -850,8 +892,17 @@ function buildSystemPrompt(character) {
 
 async function ensureMessagesLoaded(conversationId) {
   if (state.messagesCache.has(conversationId)) return;
-  const messages = await getMessages(conversationId);
-  state.messagesCache.set(conversationId, messages);
+  const localMessages = await getMessages(conversationId);
+  if (state.supabase && state.session) {
+    const remoteMessages = await fetchMessagesFromSupabase(conversationId);
+    if (remoteMessages.length) {
+      await mergeMessagesFromCloud(remoteMessages);
+      const merged = state.messagesCache.get(conversationId) || localMessages;
+      state.messagesCache.set(conversationId, merged);
+      return;
+    }
+  }
+  state.messagesCache.set(conversationId, localMessages);
 }
 
 function scrollChatToBottom() {

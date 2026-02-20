@@ -20,7 +20,9 @@ create table if not exists public.messages (
   role text not null,
   content text not null,
   model text,
-  tokens jsonb,
+  tokens_prompt integer,
+  tokens_completion integer,
+  tokens_total integer,
   is_deleted boolean default false,
   created_at timestamptz default now(),
   updated_at timestamptz default now()
