@@ -57,7 +57,9 @@ const state = {
   models: [],
   supabase: null,
   session: null,
-  syncStatus: 'idle'
+  syncStatus: 'idle',
+  syncError: '',
+  realtimeChannel: null
 };
 
 const view = document.getElementById('view');
@@ -266,15 +268,67 @@ function applyTheme() {
   document.body.className = state.settings.theme;
 }
 
-function setSyncStatus(status) {
+function getDefaultSupabaseConfig() {
+  const injectedUrl = window.SUPABASE_URL || window.__SUPABASE_URL__ || '';
+  const injectedAnon = window.SUPABASE_ANON_KEY || window.__SUPABASE_ANON_KEY__ || '';
+  return {
+    url: injectedUrl.trim(),
+    anonKey: injectedAnon.trim()
+  };
+}
+
+function clearRealtimeSubscription() {
+  if (state.realtimeChannel && state.supabase) {
+    state.supabase.removeChannel(state.realtimeChannel);
+    state.realtimeChannel = null;
+  }
+}
+
+function setupRealtimeSubscription(conversationId) {
+  clearRealtimeSubscription();
+  if (!state.supabase || !state.session || !conversationId) return;
+  const channelName = `messages-${conversationId}`;
+  state.realtimeChannel = state.supabase
+    .channel(channelName)
+    .on('postgres_changes', {
+      event: '*',
+      schema: 'public',
+      table: 'messages',
+      filter: `conversation_id=eq.${conversationId}`
+    }, async () => {
+      const remote = await fetchMessagesFromSupabase(conversationId);
+      await mergeMessagesFromCloud(remote);
+      if (state.activeConversationId === conversationId) {
+        await renderChatView();
+      } else {
+        renderConversations();
+      }
+    })
+    .subscribe();
+}
+
+function setSyncStatus(status, errorMessage = '') {
   state.syncStatus = status;
+  state.syncError = errorMessage;
   const badge = document.querySelector('[data-role="cloud-status"]');
   if (badge) badge.textContent = status;
+  const notice = document.querySelector('[data-role="cloud-error"]');
+  if (notice) notice.textContent = errorMessage;
 }
 
 function initSupabase() {
+  const defaultConfig = getDefaultSupabaseConfig();
+  if (!state.settings.supabaseUrl && defaultConfig.url) {
+    state.settings.supabaseUrl = defaultConfig.url;
+  }
+  if (!state.settings.supabaseAnonKey && defaultConfig.anonKey) {
+    state.settings.supabaseAnonKey = defaultConfig.anonKey;
+  }
+  saveLocal(STORAGE_KEYS.settings, state.settings);
+
   if (!state.settings.supabaseUrl || !state.settings.supabaseAnonKey) {
     state.supabase = null;
+    setSyncStatus('not-configured', '请在设置页填写有效的 Supabase URL 与 Anon Key。');
     return null;
   }
   const client = window.supabase?.createClient(state.settings.supabaseUrl, state.settings.supabaseAnonKey);
@@ -287,6 +341,7 @@ async function refreshSession() {
   const { data, error } = await state.supabase.auth.getSession();
   if (error) {
     console.error('supabase session error', error);
+    setSyncStatus('error', `Supabase 连接失败：${error.message}`);
     return;
   }
   state.session = data.session;
@@ -294,7 +349,10 @@ async function refreshSession() {
 }
 
 async function signInWithOtp(email) {
-  if (!state.supabase) return;
+  if (!state.supabase) {
+    alert('请先在设置中填写有效的 Supabase URL 和 Anon Key。');
+    return;
+  }
   const { error } = await state.supabase.auth.signInWithOtp({ email });
   if (error) {
     console.error('supabase signIn error', error);
@@ -487,7 +545,7 @@ async function runCloudSync() {
     setSyncStatus('synced');
   } catch (error) {
     console.error('sync error', error);
-    setSyncStatus('error');
+    setSyncStatus('error', `同步失败：${error.message || '未知错误'}`);
   }
 }
 
@@ -826,6 +884,7 @@ function renderSettings() {
           <button class="outline" data-action="logout-supabase">退出</button>
         </div>
         <div class="notice">不会上传或存储 OpenRouter API Key。</div>
+        <div class="notice" data-role="cloud-error">${state.syncError || ''}</div>
       </div>
     </section>
   `;
@@ -1575,6 +1634,11 @@ function init() {
       render();
       if (session) {
         runCloudSync();
+        if (state.activeConversationId) {
+          setupRealtimeSubscription(state.activeConversationId);
+        }
+      } else {
+        clearRealtimeSubscription();
       }
     });
   } else {
@@ -1639,10 +1703,12 @@ document.addEventListener('click', async (event) => {
       if (state.longPressActive) return;
       state.activeConversationId = id;
       await ensureMessagesLoaded(id);
+      setupRealtimeSubscription(id);
       render();
       break;
     case 'back-to-conversations':
       state.activeConversationId = null;
+      clearRealtimeSubscription();
       render();
       break;
     case 'set-theme':
@@ -1742,6 +1808,7 @@ document.addEventListener('click', async (event) => {
     }
     case 'logout-supabase':
       await signOutSupabase();
+      setSyncStatus('signed-out');
       break;
     case 'delete-profile':
       deleteProfile(id);
