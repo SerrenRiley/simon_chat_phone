@@ -463,8 +463,7 @@ async function mergeMessagesFromCloud(rows) {
     return acc;
   }, {});
   for (const [conversationId, messages] of Object.entries(grouped)) {
-    await ensureMessagesLoaded(conversationId);
-    const local = state.messagesCache.get(conversationId) || [];
+    const local = state.messagesCache.get(conversationId) || await getMessages(conversationId);
     const map = new Map(local.map((msg) => [msg.id, msg]));
     messages.forEach((row) => {
       map.set(row.id, {
@@ -483,7 +482,7 @@ async function mergeMessagesFromCloud(rows) {
         isDeleted: row.is_deleted
       });
     });
-    const merged = Array.from(map.values());
+    const merged = Array.from(map.values()).sort((a, b) => (a.createdAt || 0) - (b.createdAt || 0));
     state.messagesCache.set(conversationId, merged);
     await saveMessages(conversationId, merged);
   }
@@ -949,19 +948,17 @@ function buildSystemPrompt(character) {
   ].filter(Boolean).join('\n\n');
 }
 
-async function ensureMessagesLoaded(conversationId) {
-  if (state.messagesCache.has(conversationId)) return;
+async function ensureMessagesLoaded(conversationId, forceRemote = false) {
+  if (!forceRemote && state.messagesCache.has(conversationId)) return;
   const localMessages = await getMessages(conversationId);
+  state.messagesCache.set(conversationId, localMessages);
+
   if (state.supabase && state.session) {
     const remoteMessages = await fetchMessagesFromSupabase(conversationId);
     if (remoteMessages.length) {
       await mergeMessagesFromCloud(remoteMessages);
-      const merged = state.messagesCache.get(conversationId) || localMessages;
-      state.messagesCache.set(conversationId, merged);
-      return;
     }
   }
-  state.messagesCache.set(conversationId, localMessages);
 }
 
 function scrollChatToBottom() {
@@ -1702,7 +1699,7 @@ document.addEventListener('click', async (event) => {
     case 'open-conversation':
       if (state.longPressActive) return;
       state.activeConversationId = id;
-      await ensureMessagesLoaded(id);
+      await ensureMessagesLoaded(id, true);
       setupRealtimeSubscription(id);
       render();
       break;
