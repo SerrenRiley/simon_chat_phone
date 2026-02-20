@@ -35,8 +35,8 @@ const DEFAULT_SETTINGS = {
   showTimestamp: true,
   streaming: false,
   activeApiProfileId: DEFAULT_PROFILE.id,
-  supabaseUrl: '',
-  supabaseAnonKey: '',
+  supabaseUrl: 'https://uegpytfjxxfrxlzqrmld.supabase.co',
+  supabaseAnonKey: 'sb_publishable_glvRsKxjprJI9V79a-3Qtw_Cu_7_EIx',
   userProfile: {
     name: '我',
     avatarKey: 'user-avatar'
@@ -271,9 +271,11 @@ function applyTheme() {
 function getDefaultSupabaseConfig() {
   const injectedUrl = window.SUPABASE_URL || window.__SUPABASE_URL__ || '';
   const injectedAnon = window.SUPABASE_ANON_KEY || window.__SUPABASE_ANON_KEY__ || '';
+  const fallbackUrl = 'https://uegpytfjxxfrxlzqrmld.supabase.co';
+  const fallbackAnon = 'sb_publishable_glvRsKxjprJI9V79a-3Qtw_Cu_7_EIx';
   return {
-    url: injectedUrl.trim(),
-    anonKey: injectedAnon.trim()
+    url: (injectedUrl || fallbackUrl).trim(),
+    anonKey: (injectedAnon || fallbackAnon).trim()
   };
 }
 
